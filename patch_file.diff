@@ -1,0 +1,67 @@
+diff --git a/rss_da/training/stage1_trainer.py b/rss_da/training/stage1_trainer.py
+index 3333333..4444444 100644
+--- a/rss_da/training/stage1_trainer.py
++++ b/rss_da/training/stage1_trainer.py
+@@ -1,6 +1,13 @@
+ from __future__ import annotations
+ import math, torch
+ from torch import nn
++
++# === Part B helpers ===
++def _anneal_weight(kind: str, frac: float, t: float) -> float:
++    if not kind or kind == "none": return 1.0
++    t = max(0.0, min(1.0, t / max(1e-9, frac)))
++    if kind == "cosine":
++        return 0.5 * (1 - math.cos(math.pi * t))
++    return 1.0
+ 
+ class Stage1Trainer(nn.Module):
+@@ -120,6 +127,23 @@ class Stage1Trainer(nn.Module):
+         # ... existing forward to build mu, kappa, residuals, gate in [0,1]
+-        keep_mask = (gate >= self.cfg.train.m3_gate_keep_threshold) if self.cfg.train.m3_gate_mode != "none" else torch.ones_like(gate, dtype=torch.bool)
++        # === Part B: quantile-based keep (overrides threshold if set) ===
++        applied_q = 0.0
++        if self.cfg.train.m3_quantile_keep:
++            q = float(self.cfg.train.m3_quantile_keep)
++            q = min(max(q, 0.0), 1.0)
++            thresh = torch.quantile(gate.detach(), 1.0 - q).item()
++            keep_mask = gate >= thresh
++            outputs.m3_gate_threshold = float(thresh)
++            applied_q = q
++        else:
++            thresh = float(self.cfg.train.m3_gate_keep_threshold or 0.0)
++            keep_mask = gate >= thresh if self.cfg.train.m3_gate_mode != "none" else torch.ones_like(gate, dtype=torch.bool)
++            outputs.m3_gate_threshold = thresh
++        outputs.m3_quantile_keep = applied_q
++
++        # === Part B: anneal residual penalty ===
++        lam_resid = float(self.cfg.train.m3_lambda_resid or 0.0)
++        if lam_resid > 0 and self.cfg.train.m3_resid_anneal and self.training:
++            t = self.global_step / max(1, self.total_steps)  # ratio in [0,1]
++            lam_resid = lam_resid * _anneal_weight(self.cfg.train.m3_resid_anneal, float(self.cfg.train.m3_resid_anneal_frac or 0.3), t)
++
++        residual_penalty = lam_resid * (residuals.abs().mean())
+ 
+         # === Part B: optional circular-mean fusion ===
+-        refined_mu = mu + gate * residuals   # existing weighted fusion
++        if getattr(self.cfg.train, "m3_mean_mode", "weighted") == "circular":
++            # wrap to [-pi,pi)
++            delta = torch.atan2(torch.sin(residuals), torch.cos(residuals))
++            refined_mu = torch.atan2(torch.sin(mu) * (1-gate) + torch.sin(mu+delta) * gate,
++                                     torch.cos(mu) * (1-gate) + torch.cos(mu+delta) * gate)
++        else:
++            refined_mu = mu + gate * residuals
+ 
+         # diagnostics
+-        outputs.m3_residual_penalty = residual_penalty
+-        outputs.m3_gate_entropy = (- (gate.clamp(1e-6, 1-1e-6)*gate.log() + (1-gate).clamp(1e-6,1-1e-6)*torch.log1p(-gate))).mean()
++        outputs.m3_residual_penalty = residual_penalty
++        p = gate.clamp(1e-6, 1-1e-6)
++        outputs.m3_gate_entropy = (-(p*torch.log(p)+(1-p)*torch.log1p(-p))).mean()
++        if getattr(self.cfg.train, "m3_log_pstats", False):
++            abs_resid = residuals.abs()
++            outputs.m3_resid_abs_p10_deg = torch.quantile(abs_resid, 0.10).item() * 180.0/math.pi
++            outputs.m3_resid_abs_p50_deg = torch.quantile(abs_resid, 0.50).item() * 180.0/math.pi
++            outputs.m3_resid_abs_p90_deg = torch.quantile(abs_resid, 0.90).item() * 180.0/math.pi
+ 
+         # ... continue with loss aggregation and return
